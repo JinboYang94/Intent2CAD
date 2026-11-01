@@ -1,0 +1,12 @@
+# Verified with Python 3.12 and the existing intent2cad environment.
+cadquery==2.7.0
+cadquery-ocp==7.8.1.1.post1
+numpy==2.4.4
+PyYAML==6.0.3
+openai==2.24.0
+python-dotenv==1.2.2
+huggingface-hub==1.5.0
+datasets==4.8.4
+pyarrow==23.0.1
+trimesh==4.11.5
+scipy==1.17.1
