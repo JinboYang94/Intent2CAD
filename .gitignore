@@ -5,3 +5,6 @@ __pycache__/
 OPEN_SOURCE_PLAN.zh-CN.md
 planning/
 data/
+checkpoints/
+predictions/
+results/

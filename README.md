@@ -1,10 +1,8 @@
-# Intent2CAD
+# Intent2CAD: How Semantic–Parametric Supervision Shapes Text-to-CAD Generation
 
-**How Semantic–Parametric Supervision Shapes Text-to-CAD Generation**
+Official implementation of our NeurIPS 2026 paper. Intent2CAD studies how CAD program representations affect text-to-CAD generation and intent-preserving editing.
 
-Code and datasets for studying how CAD program representations affect text-to-CAD generation and intent-preserving editing.
-
-[Dataset](https://huggingface.co/datasets/scottyjb/Intent2CAD) · [Installation](#installation) · [Data Synthesis](#data-synthesis) · [Evaluation](#evaluation)
+[Dataset](https://huggingface.co/datasets/scottyjb/Intent2CAD) · [Installation](#installation) · [Data Preparation](#data-preparation) · [Training](#training) · [Evaluation](#evaluation)
 
 ## Overview
 
@@ -29,7 +27,7 @@ pip install -r requirements.txt
 
 ## Dataset
 
-The [Intent2CAD dataset](https://huggingface.co/datasets/scottyjb/Intent2CAD) includes aligned programs and two benchmarks:
+The [Intent2CAD dataset](https://huggingface.co/datasets/scottyjb/Intent2CAD) provides aligned programs for text-to-CAD generation and intent-preserving editing:
 
 | Configuration | Splits | Contents |
 | --- | --- | --- |
@@ -39,13 +37,10 @@ The [Intent2CAD dataset](https://huggingface.co/datasets/scottyjb/Intent2CAD) in
 Editing covers Feature Edit (FE), Consistency Edit (CE), and Derived-Relation Edit (DE).
 
 ```bash
-hf auth login
 python scripts/prepare_data.py
 ```
 
-The dataset is currently private and requires an authorized Hugging Face account. The script prepares `data/benchmark/` with the published IDs and splits. It will not overwrite an existing directory.
-
-## Data Synthesis
+## Data Preparation
 
 ```bash
 cp .env.example .env
@@ -55,7 +50,7 @@ Set these values in `.env`:
 
 | Variable | Value |
 | --- | --- |
-| `OPENAI_API_KEY` | Your API key; both LLM tasks use GPT-5.4 |
+| `OPENAI_API_KEY` | Your API key |
 | `CAD_JSON_ROOT` | DeepCAD construction records in JSON format, containing sketch geometry and modeling operations, stored as `<group>/<id>.json` |
 | `CONSTRAINT_ROOT` | Sketch constraints collected through the Onshape API, stored as `<id>_*_featurescript_*.yml` or `<id>.json`. Subdirectories are searched recursively. |
 
@@ -63,7 +58,27 @@ Set these values in `.env`:
 python scripts/synthesize.py
 ```
 
-Prepare the benchmark first to obtain the fixed split lists. The pipeline reconstructs programs, performs both lifting stages, generates descriptions, and builds editing triples. Outputs are written to a new `data/synthesized/` directory. Raw CAD records and constraint exports must be provided separately.
+The pipeline reconstructs programs, performs both lifting stages, generates descriptions, and builds editing triples. Outputs are written to a new `data/synthesized/` directory. Raw CAD records and constraint exports must be provided separately.
+
+## Training
+
+Primitive representation:
+
+```bash
+torchrun --nproc_per_node=2 training/train.py primitive
+```
+
+Semantic representation:
+
+```bash
+torchrun --nproc_per_node=2 training/train.py semantic
+```
+
+Semantic–parametric representation:
+
+```bash
+torchrun --nproc_per_node=2 training/train.py semparam
+```
 
 ## Evaluation
 
@@ -77,31 +92,14 @@ python evaluation/analyze.py results/editing/per_sample.jsonl results/editing/an
 
 Generation evaluation reports IR, CD, AR, ERS, and PRS. Editing evaluation reports edit success and unchanged-loop preservation, with CD as a geometric comparison. Each run writes per-sample results and a summary. Use `--representation semparam` to evaluate one representation; output directories must be new.
 
-## Code Structure
-
-```text
-├── scripts/             # Data preparation and synthesis entry points
-├── intent2cad/
-│   ├── datasets.py      # Hugging Face download and local data layout
-│   └── src/             # Reconstruction, lifting, validation, and edit synthesis
-├── evaluation/
-│   ├── evaluate.py      # Score saved predictions
-│   ├── analyze.py       # Grouped results and paired comparisons
-│   └── metrics/         # Generation, edit, and loop-preservation metrics
-├── assets/              # Paper figures
-└── data/                # Downloaded benchmarks and synthesis outputs (not tracked)
-```
-
 ## Citation
 
-If you use Intent2CAD in your research, please cite:
-
 ```bibtex
-@misc{yang2026intent2cad,
-  title  = {Intent2CAD: How Semantic--Parametric Supervision Shapes Text-to-CAD Generation},
-  author = {Yang, Jinbo and Jing, Shikai and Yuan, Mingyue},
-  year   = {2026},
-  url    = {https://github.com/JinboYang94/Intent2CAD}
+@inproceedings{yang2026intent2cad,
+  title     = {{Intent2CAD}: How Semantic--Parametric Supervision Shapes Text-to-CAD Generation},
+  author    = {Jinbo Yang and Mingyue Yuan and Shikai Jing},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2026}
 }
 ```
 
