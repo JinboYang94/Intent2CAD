@@ -96,7 +96,7 @@ def entity_role(group, loop, kind, constraint_type, source_loops):
     from .gate import Evidence
     from .semantic import FeatureRecognizer
     evidence = Evidence({}, {}, FeatureRecognizer)
-    matches = [unit for unit in evidence.units(source) if set(group) <= unit['tags']]
+    matches = [unit for unit in evidence.units(source) if set(group) == unit['tags']]
     if len(matches) != 1:
         return None
     unit = matches[0]

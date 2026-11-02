@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional, Set
 import math
 
+from .source_geometry import arc_is_contained, map_endpoint, primitive_endpoints, source_is_covered
+
 
 def normalize_feature_list(payload: dict) -> dict:
     """Read local feature exports in either message or btType serialization."""
@@ -51,6 +53,7 @@ class ConstraintExtractor:
         
         # 存储ID映射：yml_id -> json_id
         self.id_mapping = {}
+        self.primitive_endpoints = {}
         
         # 存储dedup文件中实际使用的TAG
         self.valid_tags: Optional[Set[str]] = None
@@ -94,6 +97,7 @@ class ConstraintExtractor:
         # 如果提供了dedup文件路径，加载有效的TAG
         if self.dedup_path:
             self.valid_tags = self._extract_tags_from_dedup()
+            self.primitive_endpoints = primitive_endpoints(Path(self.dedup_path))
     
     def _compute_normalization_params(self):
         """
@@ -166,6 +170,7 @@ class ConstraintExtractor:
             字典：curve_id -> {type, data, transform, sketch_id}
         """
         entities = {}
+        ambiguous = set()
         
         if 'entities' not in self.json_data:
             return entities
@@ -186,6 +191,8 @@ class ConstraintExtractor:
                             curve_type = curve.get('type')
                             
                             if curve_id and curve_type:
+                                if curve_id in entities and entities[curve_id]['sketch_id'] != entity_id:
+                                    ambiguous.add(curve_id)
                                 entities[curve_id] = {
                                     'type': curve_type,
                                     'data': curve,
@@ -193,6 +200,8 @@ class ConstraintExtractor:
                                     'sketch_id': entity_id  # 记录所属Sketch
                                 }
         
+        for identifier in ambiguous:
+            entities.pop(identifier, None)
         return entities
     
     def extract_yml_entities(self) -> Dict[str, Dict]:
@@ -203,6 +212,7 @@ class ConstraintExtractor:
             字典：entity_id -> {geometry, type, isConstruction}
         """
         entities = {}
+        ambiguous = set()
         
         if 'features' not in self.yml_data:
             return entities
@@ -227,6 +237,8 @@ class ConstraintExtractor:
                     if (entity_id and not is_construction and 
                         type_name not in ['BTMSketchPoint'] and
                         geometry is not None):
+                        if entity_id in entities and entities[entity_id]['feature_id'] != feature_id:
+                            ambiguous.add(entity_id)
                         entities[entity_id] = {
                             'geometry': geometry,
                             'type': type_name,
@@ -235,6 +247,8 @@ class ConstraintExtractor:
                             'feature_id': feature_id  # 记录所属Feature
                         }
         
+        for identifier in ambiguous:
+            entities.pop(identifier, None)
         return entities
     
     def match_geometry(self, json_geom: Dict, yml_geom: Dict, yml_entity_msg: Dict = None, 
@@ -274,12 +288,12 @@ class ConstraintExtractor:
         if json_type == 'Line3D':
             return self._match_line(json_geom, yml_geom, yml_entity_msg, json_transform)
         elif json_type in ['Arc3D', 'Circle3D']:
-            return self._match_arc_or_circle(json_geom, yml_geom, json_transform)
+            return self._match_arc_or_circle(json_geom, yml_geom, json_transform, yml_entity_msg=yml_entity_msg)
         
         return False
     
     def _match_line(self, json_geom: Dict, yml_geom: Dict, yml_entity_msg: Dict = None, 
-                    json_transform: Dict = None, tol: float = 1e-4) -> bool:
+                    json_transform: Dict = None, tol: float = None) -> bool:
         """
         匹配直线
         直线段由参数方程定义：P(t) = (pntX, pntY) + t·(dirX, dirY)
@@ -290,6 +304,9 @@ class ConstraintExtractor:
         1. 精确匹配：YML线段 = JSON线段（端点重合）
         2. 部分匹配：JSON线段是YML线段的子集（JSON被打断的情况）
         """
+        tol = 1e-5 / self.scale_factor if tol is None else tol
+        if not yml_entity_msg or not all(k in yml_entity_msg for k in ('startParam', 'endParam')):
+            return False
         json_start = json_geom.get('start_point', {})
         json_end = json_geom.get('end_point', {})
         
@@ -307,17 +324,12 @@ class ConstraintExtractor:
         json_start_arr = np.array([json_start.get('x', 0), json_start.get('y', 0)])
         json_end_arr = np.array([json_end.get('x', 0), json_end.get('y', 0)])
         
-        # 应用Sketch的坐标变换（将局部坐标转换到世界坐标）
-        if json_transform:
-            origin_offset = np.array([json_transform.get('x', 0), json_transform.get('y', 0)])
-            json_start_arr += origin_offset
-            json_end_arr += origin_offset
-        
+        # Both exports describe the same sketch-local plane; world origin is irrelevant.
+
         # 模式1: 精确匹配（端点重合）
-        dist1 = np.linalg.norm(json_start_arr - yml_start) + np.linalg.norm(json_end_arr - yml_end)
-        dist2 = np.linalg.norm(json_start_arr - yml_end) + np.linalg.norm(json_end_arr - yml_start)
         
-        if min(dist1, dist2) < tol * 2:
+        if ((np.linalg.norm(json_start_arr - yml_start) <= tol and np.linalg.norm(json_end_arr - yml_end) <= tol)
+                or (np.linalg.norm(json_start_arr - yml_end) <= tol and np.linalg.norm(json_end_arr - yml_start) <= tol)):
             return True
         
         # 模式2: 部分匹配（JSON是YML的子集）
@@ -370,7 +382,7 @@ class ConstraintExtractor:
         
         return json_start_on_yml and json_end_on_yml
     
-    def _match_arc_or_circle(self, json_geom: Dict, yml_geom: Dict, json_transform: Dict = None, tol: float = 1e-4) -> bool:
+    def _match_arc_or_circle(self, json_geom: Dict, yml_geom: Dict, json_transform: Dict = None, tol: float = None, yml_entity_msg: Dict = None) -> bool:
         """
         匹配圆弧或圆
         
@@ -378,6 +390,7 @@ class ConstraintExtractor:
         1. 精确匹配：圆心和半径相同
         2. 部分匹配：JSON圆弧是YML圆弧的子集（共圆心共半径）
         """
+        tol = 1e-5 / self.scale_factor if tol is None else tol
         # JSON中的圆心和半径
         json_center = json_geom.get('center_point', {})
         json_radius = json_geom.get('radius', 0)
@@ -389,18 +402,13 @@ class ConstraintExtractor:
         
         json_center_arr = np.array([json_center.get('x', 0), json_center.get('y', 0)])
         
-        # 应用Sketch的坐标变换
-        if json_transform:
-            origin_offset = np.array([json_transform.get('x', 0), json_transform.get('y', 0)])
-            json_center_arr += origin_offset
-        
         # 比较圆心和半径
         center_dist = np.linalg.norm(json_center_arr - yml_center)
         radius_diff = abs(json_radius - yml_radius)
         
-        # 圆心相同且半径相同即可匹配（无论是完整圆还是圆弧的一部分）
-        # 对于被打断的圆弧，只要圆心和半径匹配即表示共圆
-        return center_dist < tol and radius_diff < tol
+        # Circle identity and trim containment must both match.
+        return (center_dist < tol and radius_diff < tol
+                and arc_is_contained(json_geom, yml_geom, yml_entity_msg, tol))
     
     def _filter_composite_ids(self, json_ids: list) -> list:
         """
@@ -494,6 +502,10 @@ class ConstraintExtractor:
                     # 去除重复：如果有组合ID（包含'+'），则移除其中的局部ID
                     filtered_ids = self._filter_composite_ids(matching_json_ids)
                     
+                    if not source_is_covered(yml_data,
+                                             [sketch_json_entities[jid]['data'] for jid in filtered_ids],
+                                             1e-5 / self.scale_factor):
+                        continue
                     self.id_mapping[yml_id] = filtered_ids
                     
                     # 统计消耗：所有匹配的JSON实体都算作被消耗（包括组合ID中的局部ID）
@@ -588,7 +600,8 @@ class ConstraintExtractor:
                     # 去掉可能的后缀（如.start, .end, .center等）
                     base_entity_id = self._get_base_entity_id(entity_id, solid_line_ids)
                     
-                    if base_entity_id in solid_line_ids:
+                    if (base_entity_id in solid_line_ids
+                            and yml_entities[base_entity_id]['feature_id'] == message.get('featureId')):
                         valid_entities.append(entity_id)
                 
                 # 只有当所有涉及的实体都是实线时才保留
@@ -596,7 +609,7 @@ class ConstraintExtractor:
                     entity_filtered += 1
                     continue  # 跳过包含构造线/点的约束
                 
-                # 特殊处理：COINCIDENT只保留圆心重合的情况
+                # Center coincidence becomes CONCENTRIC; endpoint coincidence retains its location.
                 if constraint_type == 'COINCIDENT':
                     # 检查是否所有实体都是圆心（.center后缀）
                     is_concentric = all('.center' in eid for eid in valid_entities)
@@ -605,8 +618,7 @@ class ConstraintExtractor:
                         # 圆心重合且至少2个实体 -> 转换为CONCENTRIC
                         constraint_type = 'CONCENTRIC'
                     else:
-                        # 非圆心重合的COINCIDENT 或 只有1个实体 -> 过滤掉
-                        pass  # Preserve endpoint coincidence for semantic lifting.
+                        pass  # Endpoint identity is resolved against the emitted primitive geometry below.
                 
                 # 过滤局部约束（涉及.start, .end等局部点）
                 has_local_constraint = any(
@@ -660,11 +672,17 @@ class ConstraintExtractor:
                             
                             # 保留后缀
                             suffix = entity_id[len(base_entity_id):]
-                            
+                            if suffix in {'.start', '.end'}:
+                                mapped_ids = map_endpoint(yml_entities[base_entity_id], suffix[1:],
+                                                          json_ids, self.primitive_endpoints, self.scale_factor)
+                            elif suffix in {'', '.center'}:
+                                mapped_ids = [jid + suffix for jid in json_ids]
+                            else:
+                                mapped_ids = None  # Unknown local-point semantics are not evidence.
                             mapped_entities.append({
                                 'yml_id': entity_id,
-                                'json_ids': [jid + suffix for jid in json_ids],  # 所有对应的JSON ID
-                                'base_json_ids': json_ids,  # 基础JSON ID列表
+                                'json_ids': mapped_ids,
+                                'base_json_ids': sorted({jid.split('.', 1)[0] for jid in mapped_ids}) if mapped_ids else None,
                                 'is_combined': len(json_ids) > 1  # 是否为组合（被打断）
                             })
                         else:

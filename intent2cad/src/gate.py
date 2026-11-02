@@ -82,6 +82,42 @@ class Evidence:
             return circle_from_arc(unit["geometry"])[1]
         return math.dist(unit["geometry"]["start"], unit["geometry"]["end"])
 
+    @staticmethod
+    def endpoint(entity, loop):
+        points = []
+        edges = loop.get("segments", []) + loop.get("arcs", [])
+        for ref in entity.get("json_ids", []):
+            tag, dot, suffix = ref.partition(".")
+            matches = [e for e in edges if e.get("tag") == tag]
+            if not dot or suffix not in {"start", "end"} or not matches:
+                return None
+            points.extend(e[suffix] for e in matches)
+        if not points or any(math.dist(points[0], p) > TOL for p in points[1:]):
+            return None
+        return points[0]
+
+    @staticmethod
+    def entity_size(entity, loop, constraint_type):
+        ids = entity.get("json_ids", [])
+        if not ids or any("." in ref for ref in ids):
+            return None
+        edges = loop.get("segments", []) + loop.get("arcs", [])
+        selected = [[e for e in edges if e.get("tag") == tag] for tag in ids]
+        if any(len(group) != 1 for group in selected):
+            return None
+        selected = [group[0] for group in selected]
+        arcs = [e for e in selected if "mid" in e]
+        if arcs:
+            if len(arcs) != len(selected) or constraint_type == "LENGTH":
+                return None
+            radii = [circle_from_arc(e)[1] for e in arcs]
+            if max(radii) - min(radii) > TOL:
+                return None
+            return radii[0] * (2 if constraint_type == "DIAMETER" else 1)
+        if constraint_type not in {"LENGTH", "EQUAL"}:
+            return None
+        return sum(math.dist(e["start"], e["end"]) for e in selected)
+
     def check(self, loop):
         kind = loop.get("type")
         if kind in {"circle", "unknown"}:
@@ -110,8 +146,11 @@ class Evidence:
                     unary.setdefault(ctype, set()).add(i)
                 if ctype in {"RADIUS", "DIAMETER", "LENGTH"} and "value_normalized" in constraint:
                     value = float(constraint["value_normalized"])
-                    size = self.size(units[i])
-                    expected = size * 2 if ctype == "DIAMETER" else size
+                    if not math.isfinite(value):
+                        return False, "nonfinite_source_dimension"
+                    expected = self.entity_size(constraint["entities"][0], loop, ctype)
+                    if expected is None:
+                        continue
                     if abs(value - expected) > TOL:
                         return False, "source_dimension_conflicts_with_geometry"
                     if units[i]["kind"] == "arc" and ctype in {"RADIUS", "DIAMETER"}:
@@ -121,14 +160,14 @@ class Evidence:
                 continue
             i, j = refs
             pair = tuple(sorted(refs))
+            if ctype in {"PARALLEL", "PERPENDICULAR", "TANGENT", "ANGLE", "EQUAL"}:
+                if any("." in tag for entity in constraint["entities"] for tag in entity.get("json_ids", [])):
+                    continue
+            if ctype == "ANGLE" and "value_degrees" not in constraint:
+                continue
             if ctype == "COINCIDENT":
-                groups = constraint.get("entities", [])
-                points = []
-                for index, entity in zip(refs, groups):
-                    suffixes = {tag.split(".", 1)[1] for tag in entity.get("json_ids", []) if "." in tag}
-                    if suffixes == {"start"} or suffixes == {"end"}:
-                        points.append(units[index]["geometry"][next(iter(suffixes))])
-                if len(points) == 2:
+                points = [self.endpoint(entity, loop) for entity in constraint.get("entities", [])]
+                if len(points) == 2 and all(p is not None for p in points):
                     if math.dist(*points) > TOL:
                         return False, "coincident_endpoints_conflict"
                     endpoints.add(pair)
@@ -137,10 +176,21 @@ class Evidence:
                 residual = (first[0] * second[1] - first[1] * second[0]) if ctype == "PARALLEL" else sum(a * b for a, b in zip(first, second))
                 if abs(residual) > TOL:
                     return False, "source_constraint_conflicts_with_geometry"
-            if ctype == "EQUAL" and abs(self.size(units[i]) - self.size(units[j])) > TOL:
-                return False, "equal_constraint_conflicts_with_geometry"
+            if ctype == "EQUAL":
+                if units[i]["kind"] != units[j]["kind"]:
+                    continue
+                sizes = [self.entity_size(e, loop, ctype) for e in constraint["entities"]]
+                if any(v is None for v in sizes):
+                    continue
+                if abs(sizes[0] - sizes[1]) > TOL:
+                    return False, "equal_constraint_conflicts_with_geometry"
+                if any({tag_base(t) for t in e["json_ids"]} != units[k]["tags"]
+                       for e, k in zip(constraint["entities"], refs)):
+                    continue  # Equal subedges do not imply equal merged edges.
             if ctype == "ANGLE" and "value_degrees" in constraint and first and second:
                 angle = float(constraint["value_degrees"]) % 180
+                if not math.isfinite(angle):
+                    return False, "nonfinite_source_angle"
                 actual = math.degrees(math.acos(max(-1, min(1, sum(a * b for a, b in zip(first, second))))))
                 if min(abs(actual - angle), abs(180 - actual - angle)) > TOL:
                     return False, "angle_constraint_conflicts_with_geometry"
@@ -238,21 +288,42 @@ class Evidence:
 
     def array_supported(self, array):
         members = array["loops"]
-        if not array.get("is_regular_pattern") or len(members) < 3:
+        if (not array.get("is_regular_pattern") or len(members) < 3
+                or any(self.loops[name].get("type") != "circle" for name in members)):
+            # A constraint on one rectangle edge does not establish equality
+            # of the whole repeated feature. Only whole circles are bound here.
             return False
         size_edges, position_edges = set(), set()
         for constraint in self.constraints:
+            groups = constraint.get("entities", [])
             names = []
-            for entity in constraint.get("entities", []):
-                mapped = set().union(*(self.tag_loops.get(tag_base(t), set()) for t in entity.get("json_ids", [])))
+            for entity in groups:
+                ids = entity.get("json_ids", [])
+                mapped = set().union(*(self.tag_loops.get(tag_base(t), set()) for t in ids))
                 if len(mapped) != 1:
                     names = []
                     break
                 names.append(next(iter(mapped)))
-            if len(names) == 2 and names[0] != names[1] and set(names) <= set(members):
-                pair = tuple(names)
-                if constraint.get("type") == "EQUAL":
+            if len(names) != 2 or names[0] == names[1] or not set(names) <= set(members):
+                continue
+            first, second = (self.loops[n] for n in names)
+            pair = tuple(names)
+            kind = constraint.get("type")
+            if kind == "EQUAL":
+                if (all(all("." not in t for t in e["json_ids"]) for e in groups)
+                        and abs(first["radius"] - second["radius"]) <= TOL):
                     size_edges.add(pair)
-                if constraint.get("type") in {"DISTANCE", "MIRROR", "HORIZONTAL", "VERTICAL", "CONCENTRIC"}:
+                continue
+            if not all(all(t.endswith(".center") for t in e["json_ids"]) for e in groups):
+                continue
+            a, b = first["center"], second["center"]
+            if kind == "HORIZONTAL" and abs(a[1] - b[1]) <= TOL:
+                position_edges.add(pair)
+            elif kind == "VERTICAL" and abs(a[0] - b[0]) <= TOL:
+                position_edges.add(pair)
+            elif kind == "CONCENTRIC" and math.dist(a, b) <= TOL:
+                position_edges.add(pair)
+            elif kind == "DISTANCE" and "value_normalized" in constraint:
+                if abs(math.dist(a, b) - float(constraint["value_normalized"])) <= TOL:
                     position_edges.add(pair)
         return connected(set(members), size_edges) and connected(set(members), position_edges)
